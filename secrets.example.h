@@ -9,6 +9,11 @@
 // hotspot (8+ characters) so nobody nearby can reconfigure the unit.
 #define PORTAL_PASSWORD "change-me-please"
 
+// Optional: a network to try first on boot (2.4 GHz only), before the
+// hotspot. Leave WIFI_SSID "" to use the hotspot only.
+#define WIFI_SSID     ""
+#define WIFI_PASSWORD ""
+
 // platform.tuya.com -> Cloud -> your project -> Overview
 #define TUYA_CLIENT_ID "YOUR_TUYA_CLIENT_ID"
 #define TUYA_SECRET    "YOUR_TUYA_SECRET"

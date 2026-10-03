@@ -8,10 +8,12 @@
  * - Presence detected -> bulb ON. Nobody for OFF_DELAY_MS -> bulb OFF.
  * - Reports presence and the bulb's state to the Somnus API over WiFi, and
  *   takes light commands queued from the app. No phone needed.
- * - No WiFi details in the code: the unit opens a setup hotspot
+ * - WiFi: tries WIFI_SSID from secrets.h if set, otherwise the unit opens a setup hotspot
  *   (Somnus-room-xxxxxx) when it has no network, where the network, server
  *   address and device key are set from a phone. Hold BOOT 3 s to reopen it.
  * - Serial Monitor commands still work (115200 baud, Newline). Type "help".
+ *   "selftest" checks WiFi, clock, Tuya and blinks the bulb, with PASS/FAIL
+ *   per step. A [diag] line every 10 s shows radar -> bulb at a glance.
  *
  * WIRING (radar SEN0395 -> XIAO ESP32-C6)
  *   VIN  -> 5V
@@ -35,6 +37,12 @@
 #include "mbedtls/md.h"
 #include "secrets.h"
 
+// Older secrets.h files have no WiFi lines; the hotspot alone is used then.
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+#endif
+
 #define ROOM_FW_VERSION "0.3.0"
 static const uint8_t PAYLOAD_VERSION = 2;
 
@@ -48,6 +56,7 @@ const unsigned long WIFI_RETRY_MS    = 10000;
 const unsigned long PORTAL_AFTER_MS  = 60000;  // open the setup hotspot after this long offline
 const unsigned long BUTTON_HOLD_MS   = 3000;   // hold BOOT this long to open it on purpose
 const unsigned long RADAR_UART_OK_MS = 30000;  // radar counts as present if it spoke this recently
+const unsigned long DIAG_MS          = 10000;  // [diag] summary line
 // ====================================================================
 
 const int RADAR_OUT_PIN = D1;
@@ -81,6 +90,9 @@ unsigned long tokenExpiresAt = 0;
 bool autoMode = true;
 bool presence = false;
 bool radarLog = false;
+bool diagLog = true;       // [diag] summary and step-by-step radar/Tuya lines
+unsigned long radarUartLines = 0;
+int uartPresence = -1;     // what the radar's $JYBSS line says: -1 unknown, 0, 1
 unsigned long lastPresenceMs = 0;
 int lastRawPresence = LOW;
 unsigned long rawChangedMs = 0;
@@ -89,6 +101,10 @@ unsigned long lastRadarUartMs = 0;
 bool bulbReachable = false;
 bool lastStatusRadar = false;
 bool lastStatusBulb = false;
+
+// Last Tuya failure, for the self-test.
+int lastTuyaCode = 0;
+String lastTuyaMsg;
 
 /** What the bulb is doing, in percentages (Tuya uses 10..1000). */
 struct LightState {
@@ -295,6 +311,7 @@ void flushFrames() {
   if (code >= 200 && code < 300) {
     ringHead = (ringHead + n) % RING_SIZE;
     ringCount -= n;
+    if (diagLog) Serial.printf("[api ] sent %d frame(s) to the app -> HTTP %d\n", n, code);
   } else if (code == 400) {
     // The server will never accept this batch; keeping it would block the
     // queue forever.
@@ -329,10 +346,43 @@ String tuyaRequest(const String& method, const String& path, const String& body,
   if (withToken) http.addHeader("access_token", accessToken);
   http.addHeader("Content-Type", "application/json");
 
+  unsigned long started = millis();
   int code = (method == "POST") ? http.POST(body) : http.GET();
   String resp = code > 0 ? http.getString() : String("HTTP error ") + code;
   http.end();
+  if (diagLog) {
+    Serial.printf("[tuya] %s %s -> HTTP %d in %lu ms\n", method.c_str(), path.c_str(), code, millis() - started);
+    if (code <= 0) Serial.println("[tuya]   no answer: check the WiFi has internet and TUYA_HOST is right");
+  }
   return resp;
+}
+
+/** What a Tuya error code usually means for this setup. */
+const char* tuyaHint(int code) {
+  switch (code) {
+    case 1004: return "sign invalid: TUYA_SECRET is wrong, or the clock is off";
+    case 1010:
+    case 1011: return "token expired/invalid (retried automatically)";
+    case 1013: return "request time is off: NTP clock not synced";
+    case 1106: return "permission denied: the bulb is not linked to this cloud project. "
+                      "platform.tuya.com -> Cloud -> project -> Devices -> Link App Account, scan with Smart Life";
+    case 1108: return "uri path invalid: wrong TUYA_HOST data centre, or the API is not subscribed";
+    case 1109: return "param illegal: TUYA_DEVICE_ID is probably wrong";
+    case 2001: return "device is offline: bulb unpowered or off WiFi (Smart Life shows it offline too)";
+    case 2008: return "command not supported: this bulb uses other data point codes, type 'dps' to see them";
+    case 28841101:
+    case 28841105: return "API not authorised: subscribe the project to 'IoT Core' in Cloud -> Service API";
+    default: return "";
+  }
+}
+
+/** Keeps and prints the code/msg of a failed Tuya reply. */
+void noteTuyaError(JsonDocument& doc, const String& resp) {
+  lastTuyaCode = doc["code"] | -1;
+  lastTuyaMsg = doc["msg"] | resp.c_str();
+  Serial.printf("[tuya] FAILED code=%d msg=%s\n", lastTuyaCode, lastTuyaMsg.c_str());
+  const char* hint = tuyaHint(lastTuyaCode);
+  if (*hint) Serial.printf("[tuya]   hint: %s\n", hint);
 }
 
 bool tuyaGetToken() {
@@ -340,12 +390,13 @@ bool tuyaGetToken() {
   String resp = tuyaRequest("GET", "/v1.0/token?grant_type=1", "", false);
   if (deserializeJson(doc, resp) || !doc["success"].as<bool>()) {
     Serial.println("[tuya] token failed: " + resp);
+    noteTuyaError(doc, resp);
     return false;
   }
   accessToken = doc["result"]["access_token"].as<String>();
   long expire = doc["result"]["expire_time"].as<long>();  // seconds
   tokenExpiresAt = millis() + (unsigned long)(expire - 60) * 1000UL;
-  Serial.println("[tuya] got access token");
+  Serial.printf("[tuya] got access token (valid %ld s): client id and secret are OK\n", expire);
   return true;
 }
 
@@ -356,9 +407,20 @@ bool tuyaEnsureToken() {
 
 /** Tuya call with one retry on an expired token. Fills `doc` with the reply. */
 bool tuyaCall(const String& method, const String& path, const String& body, JsonDocument& doc) {
-  if (WiFi.status() != WL_CONNECTED || !clockValid() || !tuyaEnsureToken()) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (diagLog) Serial.println("[tuya] skipped: no WiFi");
+    return false;
+  }
+  if (!clockValid()) {
+    if (diagLog) Serial.println("[tuya] skipped: clock not synced yet (NTP)");
+    return false;
+  }
+  if (!tuyaEnsureToken()) return false;
   String resp = tuyaRequest(method, path, body, true);
-  if (deserializeJson(doc, resp)) return false;
+  if (deserializeJson(doc, resp)) {
+    Serial.println("[tuya] reply is not JSON: " + resp);
+    return false;
+  }
   int code = doc["code"] | 0;
   if (code == 1010 || code == 1011) {  // token invalid/expired
     if (!tuyaGetToken()) return false;
@@ -366,7 +428,8 @@ bool tuyaCall(const String& method, const String& path, const String& body, Json
     if (deserializeJson(doc, resp)) return false;
   }
   bool ok = doc["success"].as<bool>();
-  if (!ok) Serial.println("[tuya] failed: " + resp);
+  if (!ok) noteTuyaError(doc, resp);
+  else lastTuyaCode = 0;
   return ok;
 }
 
@@ -401,10 +464,14 @@ bool setLight(const LightChange& c, const char* source) {
 
   String body;
   serializeJson(cmds, body);
+  if (diagLog) Serial.printf("[led ] sending (%s): %s\n", source, body.c_str());
   JsonDocument reply;
   bool ok = tuyaCall("POST", String("/v1.0/iot-03/devices/") + TUYA_DEVICE_ID + "/commands", body, reply);
   bulbReachable = ok;
-  if (!ok) return false;
+  if (!ok) {
+    Serial.printf("[led ] bulb command FAILED (%s)\n", source);
+    return false;
+  }
 
   bulb.known = true;
   if (c.on == 0) bulb.on = false;
@@ -419,7 +486,7 @@ bool setLight(const LightChange& c, const char* source) {
     if (c.bright >= 0) bulb.bright = constrain(c.bright, 1, 100);
     if (c.temp >= 0) bulb.temp = constrain(c.temp, 0, 100);
   }
-  Serial.printf("[led ] %s (%s)\n", bulb.on ? "on" : "off", source);
+  Serial.printf("[led ] OK, cloud accepted: bulb %s (%s)\n", bulb.on ? "ON" : "OFF", source);
   sendLight(source);
   return true;
 }
@@ -437,17 +504,26 @@ bool sameLight(const LightState& a, const LightState& b) {
  * someone changed it elsewhere - the Smart Life app, a wall switch - and the
  * API hears about it as an external change.
  */
-void pollBulb() {
+/** Read the bulb's data points into `now`. `dump` prints every one of them. */
+bool readBulb(LightState& now, bool dump) {
   JsonDocument doc;
   bool ok = tuyaCall("GET", String("/v1.0/iot-03/devices/") + TUYA_DEVICE_ID + "/status", "", doc);
   bulbReachable = ok;
-  if (!ok) return;
+  if (!ok) return false;
 
-  LightState now = bulb;
+  now = bulb;
   now.known = true;
+  bool hasSwitch = false;
+  if (dump) Serial.println("[tuya] bulb data points (code = value):");
   for (JsonObject dp : doc["result"].as<JsonArray>()) {
     const char* code = dp["code"] | "";
     JsonVariant value = dp["value"];
+    if (dump) {
+      String v;
+      serializeJson(value, v);
+      Serial.printf("[tuya]   %-18s = %s\n", code, v.c_str());
+    }
+    if (!strcmp(code, "switch_led")) hasSwitch = true;
     if (!strcmp(code, "switch_led")) now.on = value.as<bool>();
     else if (!strcmp(code, "work_mode")) now.colour = !strcmp(value | "white", "colour");
     else if (!strcmp(code, "bright_value_v2")) now.bright = constrain(map(value.as<int>(), 10, 1000, 1, 100), 1, 100);
@@ -462,6 +538,18 @@ void pollBulb() {
       now.v = constrain((colour["v"] | 1000) / 10, 1, 100);
     }
   }
+  if (!hasSwitch) {
+    Serial.println("[tuya] WARNING: the bulb has no 'switch_led' data point, so on/off from this unit");
+    Serial.println("[tuya]   will not work. Type 'dps' and compare the codes with setLight().");
+  }
+  return true;
+}
+
+void pollBulb() {
+  static bool dumped = false;  // list the data points once, on the first good read
+  LightState now;
+  if (!readBulb(now, !dumped)) return;
+  dumped = true;
 
   if (!sameLight(now, bulb)) {
     bulb = now;
@@ -473,38 +561,57 @@ void pollBulb() {
 // ------------------------------- Radar --------------------------------
 
 void updateRadar() {
+  while (Serial1.available()) {
+    String line = Serial1.readStringUntil('\n');
+    line.trim();
+    if (radarUartLines == 0) Serial.println("[radar] UART alive, first line: " + line);
+    radarUartLines++;
+    lastRadarUartMs = millis();
+    // The SEN0395 prints "$JYBSS,1, , , *" (someone) or "$JYBSS,0, , , *" every second.
+    if (line.startsWith("$JYBSS,") && line.length() > 7) uartPresence = line[7] == '1' ? 1 : 0;
+    if (radarLog) Serial.println("[radar uart] " + line);
+  }
+
   int raw = digitalRead(RADAR_OUT_PIN);
   if (raw != lastRawPresence) {
     lastRawPresence = raw;
     rawChangedMs = millis();
+    if (diagLog) Serial.printf("[radar] OUT pin (D1) -> %s\n", raw == HIGH ? "HIGH" : "LOW");
   }
-  if (millis() - rawChangedMs > 200) {
-    bool now = (raw == HIGH);
+
+  // Either source counts, so a loose IO1 wire alone does not stop the light.
+  static bool lastDetected = false;
+  static unsigned long detectChangedMs = 0;
+  bool detected = raw == HIGH || (radarOk() && uartPresence == 1);
+  if (detected != lastDetected) {
+    lastDetected = detected;
+    detectChangedMs = millis();
+  }
+  if (millis() - detectChangedMs > 200) {
+    bool now = detected;
     if (now != presence) {
       presence = now;
-      Serial.println(presence ? "[radar] presence detected" : "[radar] no presence");
+      Serial.println(presence ? "[radar] >>> PRESENCE DETECTED" : "[radar] <<< no presence");
+      if (!presence && autoMode && bulb.on)
+        Serial.printf("[auto] nobody here, bulb goes OFF in %lu s unless someone comes back\n", OFF_DELAY_MS / 1000);
       sendPresence();
       flushNow = true;
     }
   }
   if (presence) lastPresenceMs = millis();
 
-  while (Serial1.available()) {
-    String line = Serial1.readStringUntil('\n');
-    lastRadarUartMs = millis();
-    if (radarLog) Serial.println("[radar uart] " + line);
-  }
-
   if (!autoMode) return;
   static unsigned long lastAutoTry = 0;
   if (millis() - lastAutoTry < 5000) return;  // don't spam the cloud if a request fails
   if (presence && !(bulb.known && bulb.on)) {
     lastAutoTry = millis();
+    Serial.println("[auto] presence -> turning bulb ON");
     LightChange c;
     c.on = 1;
     setLight(c, "auto");
   } else if (!presence && bulb.on && millis() - lastPresenceMs > OFF_DELAY_MS) {
     lastAutoTry = millis();
+    Serial.printf("[auto] nobody for %lu s -> turning bulb OFF\n", OFF_DELAY_MS / 1000);
     LightChange c;
     c.on = 0;
     setLight(c, "auto");
@@ -557,6 +664,9 @@ void pollCommands() {
     String id = queued["id"] | "";
     JsonObject command = queued["command"];
     const char* cmd = command["cmd"] | "?";
+    String shown;
+    serializeJson(command, shown);
+    Serial.println("[api ] command from the app: " + shown);
     String detail;
     bool ok = runCommand(command, detail);
 
@@ -568,6 +678,117 @@ void pollCommands() {
     apiRequest("POST", "/commands/" + id + "/ack", body, nullptr);
     sendAck(cmd, ok, detail);
   }
+}
+
+// ------------------------------ Diagnostics ----------------------------
+
+bool isPlaceholder(const char* v) { return strncmp(v, "YOUR_", 5) == 0 || strlen(v) == 0; }
+
+/** One line every DIAG_MS: is the radar seeing someone, and is the bulb following? */
+void printDiag() {
+  unsigned long now = millis();
+  String offIn = "-";
+  if (autoMode && !presence && bulb.on) {
+    unsigned long idle = now - lastPresenceMs;
+    offIn = idle >= OFF_DELAY_MS ? String("now") : String((OFF_DELAY_MS - idle) / 1000) + "s";
+  }
+  String uart = lastRadarUartMs ? String((now - lastRadarUartMs) / 1000) + "s ago" : String("never");
+  Serial.printf("[diag] up %lus | wifi %s | radar pin=%s presence=%s uart=%s (%lu lines, says %s) | "
+                "bulb %s %s | auto %s | off in %s\n",
+                now / 1000,
+                WiFi.status() == WL_CONNECTED ? (String("OK ") + WiFi.RSSI() + "dBm").c_str() : "DOWN",
+                lastRawPresence == HIGH ? "HIGH" : "LOW",
+                presence ? "YES" : "no",
+                uart.c_str(), radarUartLines,
+                uartPresence < 0 ? "?" : (uartPresence ? "1" : "0"),
+                !bulb.known ? "?" : (bulb.on ? "ON" : "OFF"),
+                bulbReachable ? "reachable" : "UNREACHABLE",
+                autoMode ? "ON" : "OFF",
+                offIn.c_str());
+  // The pin and the UART disagreeing for long means the IO1 wire is off.
+  if (uartPresence >= 0 && radarOk() && (uartPresence == 1) != (lastRawPresence == HIGH) &&
+      now - rawChangedMs > 3000)
+    Serial.println("[diag] WARNING: radar UART and OUT pin disagree - check the IO1 -> D1 wire");
+  if (lastRadarUartMs == 0 && now > 15000)
+    Serial.println("[diag] WARNING: nothing from the radar UART - check TX -> D7, RX -> D6 and 5V");
+}
+
+bool step(int n, const char* what, bool ok, const String& detail) {
+  Serial.printf("[test] %d. %-34s %s", n, what, ok ? "PASS" : "FAIL");
+  if (detail.length()) Serial.printf("  (%s)", detail.c_str());
+  Serial.println();
+  return ok;
+}
+
+/** Walks the whole chain and blinks the bulb. Blocks for ~10 s. */
+void selfTest() {
+  Serial.println(F("\n[test] ===== SELF TEST: radar + Tuya bulb ====="));
+  bool savedAuto = autoMode;
+  autoMode = false;  // the radar must not fight the blink
+  int failed = 0;
+
+  bool secretsOk = !isPlaceholder(TUYA_CLIENT_ID) && !isPlaceholder(TUYA_SECRET) && !isPlaceholder(TUYA_DEVICE_ID);
+  if (!step(1, "secrets.h filled in", secretsOk, String("host ") + TUYA_HOST)) failed++;
+
+  bool wifi = WiFi.status() == WL_CONNECTED;
+  if (!step(2, "WiFi connected", wifi, wifi ? WiFi.SSID() + ", " + WiFi.RSSI() + " dBm" : "type 'setup'")) failed++;
+
+  time_t t = time(nullptr);
+  bool clock = clockValid();
+  String clockStr = "not synced";
+  if (clock) { char b[32]; strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S UTC", gmtime(&t)); clockStr = b; }
+  if (!step(3, "clock synced (NTP)", clock, clockStr)) failed++;
+
+  bool radarUart = radarOk();
+  step(4, "radar UART talking", radarUart,
+       radarUart ? String(radarUartLines) + " lines, last says " + (uartPresence == 1 ? "someone" : "nobody")
+                 : "check TX->D7, RX->D6, 5V");
+  if (!radarUart) failed++;
+  Serial.printf("[test]    radar OUT pin is %s right now (wave a hand: it should go HIGH)\n",
+                digitalRead(RADAR_OUT_PIN) == HIGH ? "HIGH = someone" : "LOW = nobody");
+
+  if (!wifi || !clock) {
+    Serial.println("[test] stopping: Tuya needs WiFi and the right time");
+  } else {
+    accessToken = "";  // force a fresh token so the keys are really checked
+    bool token = tuyaGetToken();
+    if (!step(5, "Tuya token (client id + secret)", token, token ? "" : tuyaHint(lastTuyaCode))) failed++;
+
+    JsonDocument info;
+    bool infoOk = token && tuyaCall("GET", String("/v1.0/devices/") + TUYA_DEVICE_ID, "", info);
+    bool online = infoOk && info["result"]["online"].as<bool>();
+    String name = infoOk ? info["result"]["name"].as<String>() + " / " + info["result"]["product_name"].as<String>()
+                         : String(tuyaHint(lastTuyaCode));
+    if (!step(6, "bulb found in the cloud project", infoOk, name)) failed++;
+    if (infoOk && !step(7, "bulb online", online, online ? "" : "power it on; check Smart Life shows it online")) failed++;
+
+    LightState before;
+    bool read = infoOk && readBulb(before, true);
+    if (!step(8, "read bulb state", read, read ? String("it is ") + (before.on ? "ON" : "OFF") : "")) failed++;
+
+    if (read && online) {
+      Serial.println("[test]    watch the bulb: it should go ON, then OFF, then back to how it was");
+      LightChange c;
+      c.on = 1;
+      bool onOk = setLight(c, "serial");
+      delay(2500);
+      LightState after;
+      bool onSeen = onOk && readBulb(after, false) && after.on;
+      if (!step(9, "bulb turned ON (and reports ON)", onSeen, "")) failed++;
+
+      c.on = 0;
+      bool offOk = setLight(c, "serial");
+      delay(2500);
+      bool offSeen = offOk && readBulb(after, false) && !after.on;
+      if (!step(10, "bulb turned OFF (and reports OFF)", offSeen, "")) failed++;
+
+      if (before.on) { c.on = 1; setLight(c, "serial"); }
+    }
+  }
+
+  autoMode = savedAuto;
+  if (failed == 0) Serial.println("[test] ===== ALL PASS: the radar can drive the bulb. Walk in and out to see [auto] lines =====\n");
+  else Serial.printf("[test] ===== %d step(s) FAILED - read the hints above =====\n\n", failed);
 }
 
 // --------------------------- Serial commands --------------------------
@@ -582,6 +803,10 @@ void printHelp() {
     "  red | green | blue | white\n"
     "  auto on | auto off          radar controls the light\n"
     "  radarlog on | radarlog off  show radar UART output\n"
+    "  diag on | diag off          [diag] line every 10 s and step-by-step logs\n"
+    "  selftest                    check WiFi, clock, radar, Tuya, blink the bulb\n"
+    "  dps                         list the bulb's Tuya data points\n"
+    "  scan                        list the WiFi networks the unit can hear\n"
     "  setup                       open the setup hotspot (WiFi, server, key)\n"
     "  forget wifi                 erase the saved network, then restart\n"
     "  status"));
@@ -624,6 +849,16 @@ void handleCommand(String cmd) {
     }
     else if (cmd == "radarlog on") radarLog = true;
     else if (cmd == "radarlog off") radarLog = false;
+    else if (cmd == "diag on" || cmd == "diag off") {
+      diagLog = cmd == "diag on";
+      Serial.printf("[diag] %s\n", diagLog ? "ON" : "OFF");
+    }
+    else if (cmd == "selftest") selfTest();
+    else if (cmd == "scan") scanNetworks();
+    else if (cmd == "dps") {
+      LightState ignored;
+      if (!readBulb(ignored, true)) Serial.println("[tuya] could not read the bulb");
+    }
     else if (cmd == "status") {
       Serial.printf("id=%s wifi=%s%s presence=%d light=%d auto=%d radar=%d bulb=%d queued=%d\n",
                     deviceId,
@@ -685,6 +920,33 @@ void startPortal() {
   wm.startConfigPortal(portalName, PORTAL_PASSWORD);
 }
 
+const char* wifiReason(wl_status_t s) {
+  switch (s) {
+    case WL_NO_SSID_AVAIL: return "network not found (wrong name, or 5 GHz only, or too far)";
+    case WL_CONNECT_FAILED: return "refused (wrong password?)";
+    case WL_CONNECTION_LOST: return "connection lost";
+    case WL_DISCONNECTED: return "no answer in 20 s (wrong password or weak signal?)";
+    default: return "unknown";
+  }
+}
+
+/** Lists the networks the ESP32 can hear. 5 GHz ones never show up here. */
+void scanNetworks() {
+  Serial.println("[wifi] scanning...");
+  int n = WiFi.scanNetworks();
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    bool mine = strlen(WIFI_SSID) > 0 && WiFi.SSID(i) == WIFI_SSID;
+    found |= mine;
+    Serial.printf("[wifi]   %s %-32s %4d dBm  ch %2d\n", mine ? "->" : "  ",
+                  WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i));
+  }
+  if (n <= 0) Serial.println("[wifi]   nothing heard - check the antenna is attached");
+  else if (strlen(WIFI_SSID) > 0 && !found)
+    Serial.printf("[wifi]   \"%s\" is not in the list: it may be 5 GHz only, or the name differs (case matters)\n", WIFI_SSID);
+  WiFi.scanDelete();
+}
+
 void setupWifi() {
   snprintf(portalName, sizeof(portalName), "Somnus-%s", deviceId);
   loadSettings();
@@ -698,6 +960,19 @@ void setupWifi() {
   wm.setBreakAfterConfig(true);     // keep the fields even if WiFi fails
   wm.setConnectTimeout(20);
   wm.setDebugOutput(false);
+
+  if (strlen(WIFI_SSID) > 0) {
+    Serial.printf("[wifi] joining \"%s\" from secrets.h\n", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) delay(500);
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[wifi] connected to \"%s\", IP %s, %d dBm\n", WIFI_SSID,
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      return;
+    }
+    Serial.printf("[wifi] could not join \"%s\": %s\n", WIFI_SSID, wifiReason(WiFi.status()));
+    scanNetworks();
+  }
 
   Serial.println("[wifi] connecting to the saved network");
   // Joins the saved network, or opens the setup hotspot and returns at once.
@@ -752,6 +1027,11 @@ void setup() {
   makeDeviceId();
   initSeq();
   Serial.printf("[BOOT] Somnus room unit fw%s  id=%s\n", ROOM_FW_VERSION, deviceId);
+  Serial.printf("[BOOT] tuya host=%s  client id=%.4s...  bulb=%s\n", TUYA_HOST, TUYA_CLIENT_ID, TUYA_DEVICE_ID);
+  if (isPlaceholder(TUYA_CLIENT_ID) || isPlaceholder(TUYA_SECRET) || isPlaceholder(TUYA_DEVICE_ID))
+    Serial.println("[BOOT] WARNING: secrets.h still has YOUR_... placeholders, the bulb cannot work");
+  Serial.printf("[BOOT] radar: OUT on D1, UART RX D7 / TX D6. Auto %s, off after %lu s\n",
+                autoMode ? "ON" : "OFF", OFF_DELAY_MS / 1000);
 
   pinMode(RADAR_OUT_PIN, INPUT_PULLDOWN);
   Serial1.begin(115200, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
@@ -765,6 +1045,7 @@ void setup() {
   // Tuya signatures need the real time.
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   for (int i = 0; i < 20 && !clockValid(); i++) delay(500);
+  Serial.println(clockValid() ? "[time] clock synced" : "[time] clock NOT synced yet, Tuya will wait for it");
 
   if (WiFi.status() == WL_CONNECTED && clockValid()) {
     tuyaGetToken();
@@ -773,6 +1054,7 @@ void setup() {
   sendStatus();
   sendPresence();
   printHelp();
+  Serial.println("\nType 'selftest' to check everything and blink the bulb.\n");
 }
 
 void loop() {
@@ -795,6 +1077,12 @@ void loop() {
   if (now - lastTuyaPoll >= TUYA_POLL_MS) {
     lastTuyaPoll = now;
     pollBulb();
+  }
+
+  static unsigned long lastDiag = 0;
+  if (diagLog && now - lastDiag >= DIAG_MS) {
+    lastDiag = now;
+    printDiag();
   }
 
   // A sensor dropping out or coming back is worth a fresh status frame.

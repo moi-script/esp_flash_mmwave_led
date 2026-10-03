@@ -76,6 +76,15 @@ The unit checks `GET /api/v1/commands/pending` every 5 s.
 `setup` (open the hotspot), `forget wifi` (erase the saved network), `status`
 (network, server and sensor state).
 
+To check that the radar really drives the bulb:
+
+- `selftest` checks secrets, WiFi, clock, radar UART, Tuya token, that the bulb
+  is in the cloud project and online, and blinks it ON then OFF. It prints
+  PASS/FAIL for each step, and a hint when a Tuya call fails.
+- A `[diag]` line every 10 s shows the radar pin, UART, presence, the bulb's
+  state and the auto-off countdown. `diag off` hides it and the per-request logs.
+- `dps` lists the bulb's Tuya data points. On/off needs `switch_led`.
+
 ## Limits
 
 The SEN0395 reports presence only: no breathing, heart rate or distance. It
